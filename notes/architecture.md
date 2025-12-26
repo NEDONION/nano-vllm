@@ -79,122 +79,133 @@ Nano-vLLM 是一个**从零开始实现的轻量级大语言模型推理引擎**
 
 ### 3.1 分层架构图
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      用户接口层                              │
-│                  LLM.generate(prompts, params)              │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────────┐
-│                      引擎控制层                              │
-│   LLMEngine (主控制器 + 多进程管理 + 进度显示)               │
-│   ├─ 分词/解码 (AutoTokenizer)                              │
-│   ├─ 多进程张量并行 (multiprocessing)                       │
-│   └─ 批量推理协调                                            │
-└────────────┬──────────────────────────┬─────────────────────┘
-             │                          │
-┌────────────▼──────────┐   ┌───────────▼──────────────────┐
-│      调度层           │   │       资源管理层              │
-│   Scheduler           │◄──┤   BlockManager               │
-│   ├─ 请求队列管理     │   │   ├─ KV Cache 块分配/回收    │
-│   ├─ Prefill/Decode   │   │   ├─ Prefix Caching (哈希)   │
-│   │   动态调度        │   │   └─ 引用计数管理            │
-│   └─ 资源抢占策略     │   │                              │
-└────────────┬──────────┘   └──────────────────────────────┘
-             │
-┌────────────▼────────────────────────────────────────────────┐
-│                      执行层                                  │
-│   ModelRunner (模型执行器)                                   │
-│   ├─ CUDA 图捕获和重放                                       │
-│   ├─ 输入数据准备 (input_ids, positions, slot_mapping)     │
-│   ├─ 分布式通信 (NCCL)                                      │
-│   └─ 共享内存多进程通信                                      │
-└────────────┬────────────────────────────────────────────────┘
-             │
-┌────────────▼────────────────────────────────────────────────┐
-│                      模型层                                  │
-│   Qwen3ForCausalLM (Transformer 解码器)                     │
-│   ├─ VocabParallelEmbedding (词嵌入)                        │
-│   ├─ Qwen3DecoderLayer × N (解码器层)                       │
-│   │   ├─ Qwen3Attention (多头注意力)                        │
-│   │   ├─ Qwen3MLP (门控 FFN)                                │
-│   │   └─ RMSNorm × 2 (归一化)                               │
-│   └─ ParallelLMHead (输出投影)                              │
-└────────────┬────────────────────────────────────────────────┘
-             │
-┌────────────▼────────────────────────────────────────────────┐
-│                      算子层                                  │
-│   ├─ FlashAttention (注意力计算)                            │
-│   ├─ ColumnParallelLinear / RowParallelLinear (张量并行)    │
-│   ├─ RotaryEmbedding (RoPE 位置编码)                        │
-│   ├─ RMSNorm (归一化)                                        │
-│   ├─ SiluAndMul (激活函数)                                   │
-│   └─ Sampler (Token 采样)                                    │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    A[用户接口层<br/>LLM.generate] --> B[引擎控制层<br/>LLMEngine]
+
+    B --> C[调度层<br/>Scheduler]
+    B --> D[资源管理层<br/>BlockManager]
+    C <--> D
+
+    C --> E[执行层<br/>ModelRunner]
+
+    E --> F[模型层<br/>Qwen3ForCausalLM]
+
+    F --> G[算子层<br/>Layers]
+
+    style A fill:#e1f5ff
+    style B fill:#fff4e1
+    style C fill:#ffe1f5
+    style D fill:#ffe1f5
+    style E fill:#e1ffe1
+    style F fill:#f5e1ff
+    style G fill:#ffe1e1
+
+    subgraph "引擎控制层详情"
+        B1[分词/解码<br/>AutoTokenizer]
+        B2[多进程张量并行<br/>multiprocessing]
+        B3[批量推理协调]
+    end
+
+    subgraph "调度层详情"
+        C1[请求队列管理]
+        C2[Prefill/Decode<br/>动态调度]
+        C3[资源抢占策略]
+    end
+
+    subgraph "资源管理层详情"
+        D1[KV Cache 块分配/回收]
+        D2[Prefix Caching 哈希]
+        D3[引用计数管理]
+    end
+
+    subgraph "执行层详情"
+        E1[CUDA 图捕获和重放]
+        E2[输入数据准备]
+        E3[分布式通信 NCCL]
+        E4[共享内存多进程通信]
+    end
+
+    subgraph "模型层详情"
+        F1[VocabParallelEmbedding]
+        F2[Qwen3DecoderLayer × N]
+        F3[ParallelLMHead]
+    end
+
+    subgraph "算子层详情"
+        G1[FlashAttention]
+        G2[张量并行线性层]
+        G3[RotaryEmbedding]
+        G4[RMSNorm]
+        G5[SiluAndMul]
+        G6[Sampler]
+    end
 ```
 
 ### 3.2 核心模块关系
 
-```
-LLM (用户入口)
- │
- └─► LLMEngine
-      │
-      ├─► Scheduler ──────► BlockManager
-      │                     (KV Cache 管理)
-      │
-      └─► ModelRunner
-           │
-           ├─► Qwen3ForCausalLM (模型)
-           │    │
-           │    ├─► Embedding Layer
-           │    ├─► Decoder Layers (循环)
-           │    │    ├─► Attention (FlashAttn)
-           │    │    ├─► MLP
-           │    │    └─► LayerNorm
-           │    └─► LM Head
-           │
-           └─► Sampler (采样器)
+```mermaid
+graph LR
+    LLM[LLM 用户入口] --> LLMEngine
+
+    LLMEngine --> Scheduler
+    LLMEngine --> ModelRunner
+
+    Scheduler --> BlockManager[BlockManager<br/>KV Cache 管理]
+
+    ModelRunner --> Qwen3[Qwen3ForCausalLM<br/>模型]
+    ModelRunner --> Sampler[Sampler<br/>采样器]
+
+    Qwen3 --> Embedding[Embedding Layer]
+    Qwen3 --> DecoderLayers[Decoder Layers<br/>循环]
+    Qwen3 --> LMHead[LM Head]
+
+    DecoderLayers --> Attention[Attention<br/>FlashAttn]
+    DecoderLayers --> MLP
+    DecoderLayers --> LayerNorm
+
+    style LLM fill:#e1f5ff
+    style LLMEngine fill:#fff4e1
+    style Scheduler fill:#ffe1f5
+    style BlockManager fill:#ffe1f5
+    style ModelRunner fill:#e1ffe1
+    style Qwen3 fill:#f5e1ff
+    style Sampler fill:#ffe1e1
 ```
 
 ### 3.3 数据流架构
 
-```
-用户输入 (prompts)
-    │
-    ▼
-Tokenizer (分词)
-    │
-    ▼
-Scheduler (调度) ──► BlockManager (分配 KV Cache)
-    │
-    ▼
-【Prefill 阶段】
-    │ input_ids: [batch_size, seq_len]
-    │ positions: [total_tokens]
-    │ slot_mapping: [total_tokens]
-    ▼
-ModelRunner.forward()
-    │
-    ▼
-Qwen3ForCausalLM
-    │ hidden_states: [total_tokens, hidden_size]
-    ▼
-Sampler (采样第一个 token)
-    │
-    ▼
-【Decode 阶段】(循环直到 EOS/max_tokens)
-    │ input_ids: [num_running_seqs, 1]
-    │ positions: [num_running_seqs]
-    │ slot_mapping: [num_running_seqs]
-    ▼
-ModelRunner.forward() [使用 CUDA 图加速]
-    │
-    ▼
-Sampler (采样下一个 token)
-    │
-    ▼
-完成的序列 → Detokenizer → 返回结果
+```mermaid
+graph TD
+    A[用户输入 prompts] --> B[Tokenizer 分词]
+    B --> C[Scheduler 调度]
+    C --> D[BlockManager<br/>分配 KV Cache]
+
+    C --> E["【Prefill 阶段】<br/>input_ids: [batch_size, seq_len]<br/>positions: [total_tokens]<br/>slot_mapping: [total_tokens]"]
+
+    E --> F1[ModelRunner.forward]
+    F1 --> G1[Qwen3ForCausalLM<br/>hidden_states: [total_tokens, hidden_size]]
+    G1 --> H1[Sampler<br/>采样第一个 token]
+
+    H1 --> I["【Decode 阶段】<br/>循环直到 EOS/max_tokens<br/>input_ids: [num_running_seqs, 1]<br/>positions: [num_running_seqs]<br/>slot_mapping: [num_running_seqs]"]
+
+    I --> F2["ModelRunner.forward<br/>使用 CUDA 图加速"]
+    F2 --> H2[Sampler<br/>采样下一个 token]
+
+    H2 --> J{是否完成?}
+    J -->|否| I
+    J -->|是| K[完成的序列]
+
+    K --> L[Detokenizer]
+    L --> M[返回结果]
+
+    style E fill:#e1f5ff
+    style I fill:#ffe1f5
+    style F1 fill:#e1ffe1
+    style F2 fill:#e1ffe1
+    style G1 fill:#f5e1ff
+    style H1 fill:#ffe1e1
+    style H2 fill:#ffe1e1
 ```
 
 ---

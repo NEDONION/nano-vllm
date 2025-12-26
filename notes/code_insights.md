@@ -318,28 +318,27 @@ def run_cudagraph(self, seqs):
 
 ### 3. 性能对比
 
-```
-【传统执行】
-Python → PyTorch API → CUDA kernel 1
-      → PyTorch API → CUDA kernel 2
-      → PyTorch API → CUDA kernel 3
-      ...
-      → PyTorch API → CUDA kernel N
+**传统执行 vs CUDA 图执行对比**:
 
-每次 kernel 启动:
-  - CPU 准备参数（~10-50 μs）
-  - CPU-GPU 同步（~5-20 μs）
-  - kernel 排队等待（~1-10 μs）
+```mermaid
+graph TD
+    subgraph Traditional["传统执行"]
+        A1[Python] --> B1["PyTorch API → CUDA kernel 1<br/>CPU 准备参数 ~10-50 μs<br/>CPU-GPU 同步 ~5-20 μs<br/>kernel 排队等待 ~1-10 μs"]
+        B1 --> B2["PyTorch API → CUDA kernel 2"]
+        B2 --> B3["PyTorch API → CUDA kernel 3"]
+        B3 --> B4["..."]
+        B4 --> B5["PyTorch API → CUDA kernel N"]
+        B5 --> C1["总开销: N * ~20 μs = ~1-2 ms<br/>(N=50-100 kernels)"]
+    end
 
-总开销: N * ~20 μs = ~1-2 ms（N=50-100 kernels）
+    subgraph CUDAGraph["CUDA 图执行"]
+        A2[Python] --> B6["Replay CUDA Graph"]
+        B6 --> B7["所有 kernels 一次性提交<br/>(无 CPU-GPU 同步)"]
+        B7 --> C2["总开销: ~50 μs<br/><br/>加速比: 20-40x<br/>(仅启动开销部分)"]
+    end
 
-【CUDA 图执行】
-Python → Replay CUDA Graph
-      → 所有 kernels 一次性提交（无 CPU-GPU 同步）
-
-总开销: ~50 μs
-
-加速比: 20-40x（仅启动开销部分）
+    style Traditional fill:#ffe1e1
+    style CUDAGraph fill:#e1ffe1
 ```
 
 ### 4. 限制与权衡
@@ -800,14 +799,13 @@ def write_shm(self, method_name, *args):
 ```
 
 **内存布局**:
-```
+
 共享内存 (1MB):
-┌────────┬────────────────────────────────────┐
-│ 0-3    │ 数据长度 (4 bytes, little-endian)  │
-├────────┼────────────────────────────────────┤
-│ 4-N+3  │ pickle 序列化数据                  │
-└────────┴────────────────────────────────────┘
-```
+
+| 字节范围 | 内容 |
+|---------|------|
+| 0-3     | 数据长度 (4 bytes, little-endian) |
+| 4-N+3   | pickle 序列化数据 |
 
 #### 2.3 子进程读取
 

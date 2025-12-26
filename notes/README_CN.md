@@ -212,44 +212,25 @@ python bench.py
 
 ### 整体架构图
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                      用户接口层                              │
-│                  LLM.generate(prompts, params)              │
-└────────────────────────┬────────────────────────────────────┘
-                         │
-┌────────────────────────▼────────────────────────────────────┐
-│                      引擎控制层                              │
-│         LLMEngine (调度 + 分词 + 多进程管理)                 │
-└────────────┬──────────────────────────┬─────────────────────┘
-             │                          │
-┌────────────▼──────────┐   ┌───────────▼──────────────────┐
-│      调度层           │   │       资源管理层              │
-│   Scheduler           │◄──┤   BlockManager               │
-│   ├─ 请求队列         │   │   ├─ KV Cache 块分配          │
-│   ├─ Prefill/Decode   │   │   ├─ Prefix Caching          │
-│   └─ 资源抢占         │   │   └─ 引用计数管理            │
-└────────────┬──────────┘   └──────────────────────────────┘
-             │
-┌────────────▼────────────────────────────────────────────────┐
-│                      执行层                                  │
-│   ModelRunner (CUDA 图 + 分布式通信 + 数据准备)             │
-└────────────┬────────────────────────────────────────────────┘
-             │
-┌────────────▼────────────────────────────────────────────────┐
-│                      模型层                                  │
-│   Qwen3ForCausalLM (Transformer 解码器)                     │
-│   ├─ Embedding → Decoder Layers → LM Head                  │
-│   └─ Attention + MLP + LayerNorm                            │
-└────────────┬────────────────────────────────────────────────┘
-             │
-┌────────────▼────────────────────────────────────────────────┐
-│                      算子层                                  │
-│   ├─ FlashAttention (高效注意力)                            │
-│   ├─ Tensor Parallel Linear (张量并行)                      │
-│   ├─ RoPE (旋转位置编码)                                     │
-│   └─ Sampler (Token 采样)                                    │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+graph TD
+    A["用户接口层<br/>LLM.generate(prompts, params)"] --> B["引擎控制层<br/>LLMEngine (调度 + 分词 + 多进程管理)"]
+
+    B --> C["调度层<br/>Scheduler<br/>- 请求队列<br/>- Prefill/Decode<br/>- 资源抢占"]
+    B --> D["资源管理层<br/>BlockManager<br/>- KV Cache 块分配<br/>- Prefix Caching<br/>- 引用计数管理"]
+    D -.-> C
+
+    C --> E["执行层<br/>ModelRunner (CUDA 图 + 分布式通信 + 数据准备)"]
+    E --> F["模型层<br/>Qwen3ForCausalLM (Transformer 解码器)<br/>- Embedding → Decoder Layers → LM Head<br/>- Attention + MLP + LayerNorm"]
+    F --> G["算子层<br/>- FlashAttention (高效注意力)<br/>- Tensor Parallel Linear (张量并行)<br/>- RoPE (旋转位置编码)<br/>- Sampler (Token 采样)"]
+
+    style A fill:#e1f5ff
+    style B fill:#fff4e1
+    style C fill:#ffe1e1
+    style D fill:#ffe1e1
+    style E fill:#e1ffe1
+    style F fill:#f0e1ff
+    style G fill:#ffe1f0
 ```
 
 ### 目录结构
@@ -387,14 +368,35 @@ Time 3: [Seq1, Seq2, Seq4, Seq5]  ← Seq5 立即加入
 
 类似操作系统的虚拟内存：
 
-```
-KV Cache 物理内存（GPU）:
-┌────┬────┬────┬────┬────┬────┬────┬────┐
-│ 块0 │ 块1 │ 块2 │ 块3 │ 块4 │ 块5 │ 块6 │ 块7 │
-└────┴────┴────┴────┴────┴────┴────┴────┘
+```mermaid
+graph LR
+    subgraph GPU["KV Cache 物理内存 (GPU)"]
+        B0[块0]
+        B1[块1]
+        B2[块2]
+        B3[块3]
+        B4[块4]
+        B5[块5]
+        B6[块6]
+        B7[块7]
+    end
 
-序列 1 的块表: [0, 3, 5]  → 使用块 0, 3, 5
-序列 2 的块表: [1, 2, 4]  → 使用块 1, 2, 4
+    S1["序列 1<br/>块表: [0, 3, 5]"] -.-> B0
+    S1 -.-> B3
+    S1 -.-> B5
+
+    S2["序列 2<br/>块表: [1, 2, 4]"] -.-> B1
+    S2 -.-> B2
+    S2 -.-> B4
+
+    style S1 fill:#e1f5ff
+    style S2 fill:#fff4e1
+    style B0 fill:#ffe1e1
+    style B1 fill:#e1ffe1
+    style B2 fill:#e1ffe1
+    style B3 fill:#ffe1e1
+    style B4 fill:#e1ffe1
+    style B5 fill:#ffe1e1
 ```
 
 **优势**:
@@ -427,17 +429,22 @@ KV Cache 物理内存（GPU）:
 
 预录制 GPU 操作序列：
 
-```
-传统执行:
-Python → Kernel 1 启动 → Kernel 1 执行
-      → Kernel 2 启动 → Kernel 2 执行
-      ...（每个 kernel 都有启动开销）
+```mermaid
+graph LR
+    subgraph Traditional["传统执行"]
+        A1[Python] --> B1["Kernel 1 启动 → Kernel 1 执行"]
+        B1 --> B2["Kernel 2 启动 → Kernel 2 执行"]
+        B2 --> B3["...<br/>每个 kernel 都有启动开销"]
+    end
 
-CUDA 图:
-Python → 重放图（一次性提交所有 kernel）
-      → Kernel 1, 2, 3, ... 并行执行
+    subgraph CUDAGraph["CUDA 图"]
+        A2[Python] --> C1["重放图<br/>(一次性提交所有 kernel)"]
+        C1 --> C2["Kernel 1, 2, 3, ... 并行执行"]
+        C2 --> C3["加速比: ~30% 延迟降低"]
+    end
 
-加速比: ~30% 延迟降低
+    style Traditional fill:#ffe1e1
+    style CUDAGraph fill:#e1ffe1
 ```
 
 **限制**: 输入形状必须固定（因此仅在 Decode 阶段使用）

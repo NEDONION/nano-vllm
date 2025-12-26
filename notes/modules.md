@@ -68,19 +68,43 @@ class LLMEngine:
 ```
 
 **多进程架构**:
+
+```mermaid
+graph TD
+    subgraph "主进程 rank=0"
+        A[LLMEngine]
+        B[Scheduler]
+        C[ModelRunner rank=0]
+    end
+
+    subgraph "子进程 rank=1,2,...,N-1"
+        D1[ModelRunner rank=1]
+        D2[ModelRunner rank=2]
+        D3[ModelRunner rank=N-1]
+    end
+
+    A --> B
+    A --> C
+
+    C -.共享内存.-> D1
+    C -.共享内存.-> D2
+    C -.共享内存.-> D3
+
+    C -.Event同步.-> D1
+    C -.Event同步.-> D2
+    C -.Event同步.-> D3
+
+    style A fill:#fff4e1
+    style B fill:#ffe1f5
+    style C fill:#e1ffe1
+    style D1 fill:#e1ffe1
+    style D2 fill:#e1ffe1
+    style D3 fill:#e1ffe1
 ```
-主进程 (rank=0)
-    ├─ LLMEngine
-    ├─ Scheduler
-    └─ ModelRunner (rank=0)
 
-子进程 (rank=1,2,...,N-1)
-    └─ ModelRunner (rank=1,2,...,N-1)
-
-通信方式：
+**通信方式**:
 - 共享内存（输入/输出 tensors）
 - multiprocessing.Event（同步信号）
-```
 
 **性能监控**:
 - Prefill 吞吐量（tokens/s）
@@ -235,10 +259,14 @@ class Sequence:
 ```
 
 **序列状态机**:
-```
-WAITING ──schedule──> RUNNING ──finish──> FINISHED
-    ↑                    │
-    └────── preempt ─────┘
+
+```mermaid
+stateDiagram-v2
+    [*] --> WAITING
+    WAITING --> RUNNING: schedule
+    RUNNING --> FINISHED: finish
+    RUNNING --> WAITING: preempt
+    FINISHED --> [*]
 ```
 
 **块表（Block Table）示例**:
@@ -878,64 +906,111 @@ class LLM(LLMEngine):
 
 ### 层次依赖
 
-```
-用户接口层
-    ├─ llm.py (LLM)
+```mermaid
+graph TD
+    subgraph "用户接口层"
+        A[llm.py LLM]
+    end
 
-引擎层
-    ├─ engine/llm_engine.py (LLMEngine)
-    │   ├─ engine/scheduler.py (Scheduler)
-    │   │   └─ engine/block_manager.py (BlockManager)
-    │   │       └─ engine/sequence.py (Sequence)
-    │   └─ engine/model_runner.py (ModelRunner)
+    subgraph "引擎层"
+        B[engine/llm_engine.py]
+        C[engine/scheduler.py]
+        D[engine/block_manager.py]
+        E[engine/sequence.py]
+        F[engine/model_runner.py]
+    end
 
-模型层
-    └─ models/qwen3.py (Qwen3ForCausalLM)
-        ├─ layers/embed_head.py (VocabParallelEmbedding, ParallelLMHead)
-        ├─ layers/layernorm.py (RMSNorm)
-        └─ Qwen3DecoderLayer
-            ├─ layers/attention.py (Qwen3Attention)
-            │   ├─ layers/linear.py (QKVParallelLinear, RowParallelLinear)
-            │   ├─ layers/rotary_embedding.py (RotaryEmbedding)
-            │   └─ layers/attention.py (Attention)
-            └─ layers/mlp.py (Qwen3MLP)
-                ├─ layers/linear.py (MergedColumnParallelLinear, RowParallelLinear)
-                └─ layers/activation.py (SiluAndMul)
+    subgraph "模型层"
+        G[models/qwen3.py]
+        H[layers/embed_head.py]
+        I[layers/layernorm.py]
+        J[Qwen3DecoderLayer]
+    end
 
-工具层
-    ├─ utils/context.py (Context)
-    └─ utils/loader.py (load_weights)
+    subgraph "Qwen3DecoderLayer 内部"
+        K[layers/attention.py Qwen3Attention]
+        L[layers/linear.py QKV/Row Parallel]
+        M[layers/rotary_embedding.py]
+        N[layers/attention.py Attention]
+        O[Qwen3MLP]
+        P[layers/linear.py Merged/Row Parallel]
+        Q[layers/activation.py]
+    end
 
-配置层
-    ├─ config.py (Config)
-    └─ sampling_params.py (SamplingParams)
+    subgraph "工具层"
+        R[utils/context.py]
+        S[utils/loader.py]
+    end
+
+    subgraph "配置层"
+        T[config.py]
+        U[sampling_params.py]
+    end
+
+    A --> B
+    B --> C
+    B --> F
+    C --> D
+    D --> E
+
+    F --> G
+    G --> H
+    G --> I
+    G --> J
+
+    J --> K
+    J --> O
+    K --> L
+    K --> M
+    K --> N
+    O --> P
+    O --> Q
+
+    style A fill:#e1f5ff
+    style B fill:#fff4e1
+    style C fill:#ffe1f5
+    style D fill:#ffe1f5
+    style F fill:#e1ffe1
+    style G fill:#f5e1ff
 ```
 
 ### 模块间通信
 
-```
-用户 → LLM.generate()
-        │
-        ▼
-    LLMEngine
-        │
-        ├─► Tokenizer (分词)
-        │
-        ├─► Scheduler.schedule()
-        │       │
-        │       └─► BlockManager (分配 KV Cache)
-        │
-        ├─► ModelRunner.run()
-        │       │
-        │       ├─► Context (设置元数据)
-        │       │
-        │       └─► Qwen3ForCausalLM.forward()
-        │               │
-        │               └─► Layers (Attention, MLP, etc.)
-        │
-        └─► Scheduler.postprocess()
-                │
-                └─► BlockManager (释放 KV Cache)
+```mermaid
+sequenceDiagram
+    actor User as 用户
+    participant LLM as LLM.generate
+    participant Engine as LLMEngine
+    participant Tokenizer
+    participant Scheduler
+    participant BlockMgr as BlockManager
+    participant Runner as ModelRunner
+    participant Context
+    participant Model as Qwen3ForCausalLM
+    participant Layers
+
+    User->>LLM: generate(prompts)
+    LLM->>Engine: 开始推理
+
+    Engine->>Tokenizer: encode(prompts)
+    Tokenizer-->>Engine: token_ids
+
+    Engine->>Scheduler: schedule()
+    Scheduler->>BlockMgr: allocate(seq)
+    BlockMgr-->>Scheduler: block_table
+
+    Engine->>Runner: run(seqs, is_prefill)
+    Runner->>Context: set_context(metadata)
+    Runner->>Model: forward(input_ids, positions)
+    Model->>Layers: Attention, MLP, etc.
+    Layers-->>Model: output
+    Model-->>Runner: logits
+
+    Engine->>Scheduler: postprocess(seqs, token_ids)
+    Scheduler->>BlockMgr: deallocate(seq)
+
+    Engine-->>LLM: 返回结果
+    LLM-->>User: generated_text
 ```
 
 ---
